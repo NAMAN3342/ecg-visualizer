@@ -18,6 +18,7 @@ export default function ECGVisualizer(){
   const [pixelsPerMm, setPixelsPerMm] = useState(DEFAULT_PIXELS_PER_MM)
   const [secondsWindow, setSecondsWindow] = useState(DEFAULT_SECONDS)
   const [inputUnits, setInputUnits] = useState('mv') // 'mv' | 'adc'
+  const [filterOn, setFilterOn] = useState(true) // DSP bandpass (0.5–40 Hz)
 
   // Final Report Recording (10 seconds)
   const [isRecording, setIsRecording] = useState(false)
@@ -41,6 +42,14 @@ export default function ECGVisualizer(){
   const writeIndexRef = useRef(0)
   const runningRef = useRef(false)
   const pairCanvasRefs = useRef([]) // 3 canvases for 3 rows of paired leads
+  // DSP filter state per lead (one-pole HP + one-pole LP)
+  const hpStateRef = useRef(leads.map(()=>({x1:0,y1:0})))
+  const lpStateRef = useRef(leads.map(()=>({y1:0})))
+  const hpAlphaRef = useRef(0)
+  const lpAlphaRef = useRef(0)
+  // Recording via refs to avoid stale closures
+  const recordRef = useRef({ active:false, data:null, count:0 })
+  const sampleRateRef = useRef(sampleRate)
 
   // (re)initialize buffers when secondsWindow changes
   useEffect(()=>{
@@ -64,6 +73,26 @@ export default function ECGVisualizer(){
 
   // Ensure canvas dimensions track settings
   useEffect(()=>{ sizeAllCanvases() },[pixelsPerMm, secondsWindow])
+
+  // keep sampleRate in a ref for use inside serial loop
+  useEffect(()=>{ sampleRateRef.current = sampleRate },[sampleRate])
+
+  // Recompute filter coefficients when sampleRate changes
+  useEffect(()=>{
+    const dt = 1/Math.max(1, sampleRateRef.current)
+    // High-pass ~0.5 Hz
+    const hpFc = 0.5
+    const hpRc = 1/(2*Math.PI*hpFc)
+    hpAlphaRef.current = hpRc/(hpRc + dt)
+    // Low-pass ~40 Hz
+    const lpFc = 40
+    const lpRc = 1/(2*Math.PI*lpFc)
+    lpAlphaRef.current = dt/(lpRc + dt)
+    // reset states when rate changes
+    hpStateRef.current = leads.map(()=>({x1:0,y1:0}))
+    lpStateRef.current = leads.map(()=>({y1:0}))
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[sampleRate])
 
   // Convert incoming value to mV (heuristic)
   function valueToMv(v){
@@ -133,7 +162,9 @@ export default function ECGVisualizer(){
     const calHeightPx = 10 * pixelsPerMm // 10 mm = 1 mV
     const calWidthPx = 5 * pixelsPerMm   // 5 mm = 0.2 s at 25 mm/s
     const calX = xOffset + 8
-    ctx.fillStyle = '#41ff8b'
+    ctx.fillStyle = '#00d9ff'
+    ctx.shadowColor = 'rgba(0,217,255,0.5)'
+    ctx.shadowBlur = 8
     ctx.beginPath()
     ctx.moveTo(calX, baselineY)
     ctx.lineTo(calX, baselineY - calHeightPx)
@@ -141,6 +172,7 @@ export default function ECGVisualizer(){
     ctx.lineTo(calX + calWidthPx, baselineY)
     ctx.closePath()
     ctx.fill()
+    ctx.shadowBlur = 0
 
     // Lead label
     ctx.fillStyle = 'rgba(229,231,235,0.9)'
@@ -149,9 +181,9 @@ export default function ECGVisualizer(){
 
     // waveform
     ctx.lineWidth = 1.6
-    ctx.strokeStyle = '#41ff8b'
-    ctx.shadowColor = 'rgba(65,255,139,0.25)'
-    ctx.shadowBlur = 4
+    ctx.strokeStyle = '#00d9ff'
+    ctx.shadowColor = 'rgba(0,217,255,0.4)'
+    ctx.shadowBlur = 6
     ctx.beginPath()
     let x = xOffset
     for(let s=0;s<samples;s++){
@@ -169,134 +201,183 @@ export default function ECGVisualizer(){
     ctx.shadowColor = 'transparent'
   }
 
-  // animation
+  // One-pole high-pass followed by one-pole low-pass per-lead
+  function filterSample(leadIdx, x){
+    // high-pass: y[n] = a*(y[n-1] + x[n] - x[n-1])
+    const aHP = hpAlphaRef.current
+    const stHP = hpStateRef.current[leadIdx]
+    const yHP = aHP * (stHP.y1 + x - stHP.x1)
+    stHP.x1 = x
+    stHP.y1 = yHP
+    // low-pass: y[n] = y[n-1] + a*(x - y[n-1]) with x=yHP
+    const aLP = lpAlphaRef.current
+    const stLP = lpStateRef.current[leadIdx]
+    const y = stLP.y1 + aLP * (yHP - stLP.y1)
+    stLP.y1 = y
+    return y
+  }
+
+  // animation - always run so live ECG continues while report modal is open
   useEffect(()=>{
-    if(showReport) return // Don't animate when showing report
     let raf = null
     function tick(){ drawAll(); raf = requestAnimationFrame(tick) }
     raf = requestAnimationFrame(tick)
     return ()=>{ if(raf) cancelAnimationFrame(raf) }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[pixelsPerMm,secondsWindow,gain,showReport])
+  },[pixelsPerMm,secondsWindow,gain])
 
-  // Draw final report canvas when report is shown
-  useEffect(() => {
-    if (!showReport || !recordedData || !reportCanvasRef.current) return
-    
-    const canvas = reportCanvasRef.current
+  // Draw report to a given canvas (shared by modal and export)
+  function drawReportPage(canvas, data) {
     const ctx = canvas.getContext('2d')
-    
-    const ppm = 4 // pixels per mm for report (high-res)
-    const paperWidth = 297 // A4 landscape mm (traditional ECG sheet)
-    const paperHeight = 210
+    const ppm = 8 // pixels per mm for crisp output
+    const paperWidth = 297, paperHeight = 210 // A4 landscape mm
     canvas.width = paperWidth * ppm
     canvas.height = paperHeight * ppm
-    
-    // Draw traditional WHITE background
+
+    // Background
     ctx.fillStyle = '#ffffff'
     ctx.fillRect(0, 0, canvas.width, canvas.height)
-    
-    // RED ECG paper grid lines (1mm minor, 5mm major)
-    for (let x = 0; x <= canvas.width; x += ppm) {
-      const isMajor = (x % (5 * ppm) === 0)
-      ctx.strokeStyle = isMajor ? 'rgba(220, 38, 38, 0.6)' : 'rgba(220, 38, 38, 0.25)'
-      ctx.lineWidth = isMajor ? 1 : 0.6
-      ctx.beginPath()
-      ctx.moveTo(x + 0.5, 0)
-      ctx.lineTo(x + 0.5, canvas.height)
-      ctx.stroke()
-    }
-    for (let y = 0; y <= canvas.height; y += ppm) {
-      const isMajor = (y % (5 * ppm) === 0)
-      ctx.strokeStyle = isMajor ? 'rgba(220, 38, 38, 0.6)' : 'rgba(220, 38, 38, 0.25)'
-      ctx.lineWidth = isMajor ? 1 : 0.6
-      ctx.beginPath()
-      ctx.moveTo(0, y + 0.5)
-      ctx.lineTo(canvas.width, y + 0.5)
-      ctx.stroke()
-    }
-    
-    // Layout: 3 rows of paired leads
-    const rowHeight = 60 * ppm  // 60mm per row
-    const margin = 10 * ppm
-    const headerHeight = 15 * ppm
-    
-    // Add header info
-    ctx.fillStyle = '#0b0f14'
-    ctx.font = 'bold 18px Arial, Helvetica, sans-serif'
-    ctx.fillText('NextECG — 10 Second Report', margin, margin + 14)
-    ctx.font = '12px Arial, Helvetica, sans-serif'
-    ctx.fillText(`Sample Rate: ${sampleRate} Hz  |  Speed: 25 mm/s  |  Gain: ${gain.toFixed(1)}x`, margin, margin + 30)
 
-    // Draw calibration pulse marker (1 mV for 200 ms)
+    // Grid
+    // Minor 1mm
+    ctx.strokeStyle = 'rgba(255, 100, 100, 0.5)'
+    ctx.lineWidth = 1
+    for (let x = 0; x <= canvas.width; x += ppm) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,canvas.height); ctx.stroke() }
+    for (let y = 0; y <= canvas.height; y += ppm) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(canvas.width,y); ctx.stroke() }
+    // Major 5mm
+    ctx.strokeStyle = 'rgba(220,38,38,0.9)'
+    ctx.lineWidth = 2
+    for (let x = 0; x <= canvas.width; x += ppm*5) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,canvas.height); ctx.stroke() }
+    for (let y = 0; y <= canvas.height; y += ppm*5) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(canvas.width,y); ctx.stroke() }
+
+    const marginMm = 10
+    const margin = marginMm * ppm
+    const headerMm = 25
+    const headerH = headerMm * ppm
+
+    // Header
+    ctx.fillStyle = '#000'
+    ctx.font = 'bold 20px Arial, Helvetica, sans-serif'
+    ctx.fillText('NextECG — 10 Second ECG Report', margin, margin + 16)
+    ctx.font = '14px Arial, Helvetica, sans-serif'
+    const dateStr = new Date().toLocaleString()
+    ctx.fillText(`${dateStr}  |  Speed: 25 mm/s  |  Amplitude: 10 mm/mV  |  Filter: 0.5–40 Hz  |  ${sampleRate} Hz`, margin, margin + 36)
+
+    // Calibration pulse 1mV
     const calX = margin
-    const calY = headerHeight + 5
-    const calHeightPx = 10 * ppm // 10mm = 1mV
-    const calWidthPx = 5 * ppm   // 5mm = 0.2s at 25mm/s
-    ctx.strokeStyle = '#0b0f14'
-    ctx.lineWidth = 1.4
+    const calY = margin + headerH - (12*ppm)
+    ctx.strokeStyle = '#000'
+    ctx.lineWidth = 2.5
+    ctx.lineCap = 'round'
+    ctx.lineJoin = 'round'
     ctx.beginPath()
     ctx.moveTo(calX, calY)
-    ctx.lineTo(calX, calY + calHeightPx)
-    ctx.lineTo(calX + calWidthPx, calY + calHeightPx)
-    ctx.lineTo(calX + calWidthPx, calY)
+    ctx.lineTo(calX, calY + 10*ppm)
+    ctx.lineTo(calX + 5*ppm, calY + 10*ppm)
+    ctx.lineTo(calX + 5*ppm, calY)
     ctx.stroke()
-    ctx.fillStyle = '#0b0f14'
-    ctx.font = '10px Arial'
-    ctx.fillText('1mV', calX + calWidthPx + 3, calY + 8)
+    ctx.fillText('1mV', calX + 6*ppm, calY + 6*ppm)
 
-    leadPairs.forEach((pair, rowIdx) => {
-      const [leftIdx, rightIdx] = pair
-      const yBase = headerHeight + margin + rowIdx * rowHeight + rowHeight / 2
-      const halfWidth = (canvas.width - 2 * margin) / 2
-      
-      // Draw left lead
-      drawReportLead(ctx, recordedData[leads[leftIdx]], leads[leftIdx], margin, yBase, halfWidth, ppm)
-      
-      // Draw right lead  
-      drawReportLead(ctx, recordedData[leads[rightIdx]], leads[rightIdx], margin + halfWidth, yBase, halfWidth, ppm)
+    // Seconds markers across header
+    const anyLead = data['I'] || data['II'] || data['III'] || data['aVR'] || data['aVL'] || data['aVF']
+    const totalSeconds = anyLead ? anyLead.length / sampleRate : 10
+    const secondsToShow = Math.ceil(totalSeconds)
+    ctx.strokeStyle = '#000'
+    ctx.lineWidth = 1.5
+    ctx.font = '12px Arial, Helvetica, sans-serif'
+    for (let s=0; s<=secondsToShow; s++){
+      const x = margin + s * 25 * ppm
+      ctx.beginPath(); ctx.moveTo(x, margin + headerH - 20); ctx.lineTo(x, margin + headerH - 10); ctx.stroke()
+      ctx.fillText(`${s}s`, x + 3, margin + headerH - 14)
+    }
+
+    // Lead layout
+    const leadOrder = ['I','II','III','aVR','aVL','aVF']
+    const leadHeightMm = 28
+    const leadHeight = leadHeightMm * ppm
+    const startY = margin + headerH + 5
+    const innerWidth = canvas.width - 2*margin
+
+    leadOrder.forEach((ln, idx) => {
+      const yBase = startY + idx * leadHeight + (leadHeight/2)
+      drawReportLeadStrip(ctx, data[ln], ln, margin, yBase, innerWidth, ppm)
     })
-    
-  }, [showReport, recordedData, sampleRate, gain, leads, leadPairs])
+  }
 
-  function drawReportLead(ctx, samples, leadName, xStart, yBase, width, ppm) {
+  // When report is shown, render into the visible canvas
+  useEffect(() => {
+    if (!showReport || !recordedData || !reportCanvasRef.current) return
+    drawReportPage(reportCanvasRef.current, recordedData)
+  }, [showReport, recordedData, sampleRate, gain])
+
+  function drawReportLeadStrip(ctx, samples, leadName, xStart, yBase, width, ppm) {
     if (!samples || samples.length === 0) return
     
-    // Draw lead label
-    ctx.fillStyle = '#0b0f14'
-    ctx.font = 'bold 14px Arial, Helvetica, sans-serif'
-    ctx.fillText(leadName, xStart + 5, yBase - 40)
+    // Lead label - BOLD BLACK
+    ctx.fillStyle = '#000000'
+    ctx.font = 'bold 18px Arial, Helvetica, sans-serif'
+    ctx.fillText(leadName, xStart + 2, yBase - 10)
     
-    // Draw baseline
-    ctx.strokeStyle = 'rgba(17,24,39,0.25)'
-    ctx.lineWidth = 0.6
+    // Baseline reference
+    ctx.strokeStyle = 'rgba(0,0,0,0.15)'
+    ctx.lineWidth = 0.8
+    ctx.setLineDash([4, 4])
     ctx.beginPath()
-    ctx.moveTo(xStart, yBase + 0.5)
-    ctx.lineTo(xStart + width, yBase + 0.5)
+    ctx.moveTo(xStart, yBase)
+    ctx.lineTo(xStart + width, yBase)
     ctx.stroke()
-    
-    // Draw waveform (BLACK on red paper)
-    ctx.strokeStyle = '#0b0f14'
-    ctx.lineWidth = 1.2
-    ctx.shadowColor = 'transparent'
-    ctx.shadowBlur = 0
-    ctx.beginPath()
-    
-    const mmPerSec = 25 // standard ECG paper speed
+    ctx.setLineDash([])
+
+    // Per-lead second ticks at baseline (25mm intervals)
+    const mmPerSec = 25
     const totalSeconds = samples.length / sampleRate
     const totalWidthMm = totalSeconds * mmPerSec
-    const availWidthMm = (width / ppm) - 10 // 10mm padding
-    const xScale = availWidthMm / totalWidthMm
+    const availWidthMm = (width / ppm) - 5
+    const timeScale = Math.min(1.0, availWidthMm / totalWidthMm)
+    ctx.strokeStyle = 'rgba(0,0,0,0.5)'
+    ctx.lineWidth = 1
+    for (let s = 0; s <= Math.ceil(totalSeconds); s++){
+      const xMm = s * mmPerSec * timeScale
+      const x = xStart + (xMm * ppm)
+      ctx.beginPath(); ctx.moveTo(x, yBase - 6); ctx.lineTo(x, yBase + 6); ctx.stroke()
+    }
+    
+    // ECG WAVEFORM - THICK BLACK with ANTI-ALIASING
+    ctx.strokeStyle = '#000000'
+    ctx.lineWidth = 2.5
+    ctx.lineCap = 'round'
+    ctx.lineJoin = 'round'
+    ctx.shadowColor = 'rgba(0,0,0,0.2)'
+    ctx.shadowBlur = 1
+    
+    ctx.beginPath()
+    
+  const mmPerSec2 = 25 // standard ECG paper speed
+  const totalSeconds2 = samples.length / sampleRate
+  const totalWidthMm2 = totalSeconds2 * mmPerSec2 // total width needed in mm
+  const availWidthMm2 = (width / ppm) - 5 // available width minus padding
+    
+  // If recording is longer than available width, compress time scale proportionally
+  const timeScale2 = Math.min(1.0, availWidthMm2 / totalWidthMm2)
     
     for (let i = 0; i < samples.length; i++) {
-      const xPos = xStart + 5 * ppm + (i / sampleRate) * mmPerSec * ppm * xScale
-      const mv = samples[i]
-      const yPos = yBase - (mv * DEFAULT_MM_PER_MV * gain * ppm)
+  const timeSec = i / sampleRate
+  const xMm = timeSec * mmPerSec2 * timeScale2
+      const xPos = xStart + (xMm * ppm)
       
-      if (i === 0) ctx.moveTo(xPos, yPos)
-      else ctx.lineTo(xPos, yPos)
+      const mv = samples[i]
+      const yMm = mv * DEFAULT_MM_PER_MV * gain // 10mm per mV standard
+      const yPos = yBase - (yMm * ppm)
+      
+      if (i === 0) {
+        ctx.moveTo(xPos, yPos)
+      } else {
+        ctx.lineTo(xPos, yPos)
+      }
     }
     ctx.stroke()
+    ctx.shadowColor = 'transparent'
+    ctx.shadowBlur = 0
   }
 
   // connect via Web Serial
@@ -371,23 +452,35 @@ export default function ECGVisualizer(){
             continue
           }
 
-          // Recording for final report (auto-capture)
-          if (isRecording) {
-            const mvs = arr.map(v => valueToMv(v))
+          // Convert and optionally filter
+          const mvs = arr.map(v => valueToMv(v))
+          for(let i=0;i<mvs.length;i++){
+            if(filterOn) mvs[i] = filterSample(i, mvs[i])
+          }
+
+          // Recording for final report (auto-capture via ref)
+          if (recordRef.current.active && recordRef.current.data) {
             leads.forEach((ln, idx) => {
-              recordedData[ln].push(mvs[idx])
+              recordRef.current.data[ln].push(mvs[idx])
             })
-            const duration = recordedData['Lead I'].length / sampleRate
+            recordRef.current.count += 1
+            const duration = recordRef.current.count / sampleRateRef.current
             setRecordingProgress(Math.min(duration, CAPTURE_SECONDS))
             if (duration >= CAPTURE_SECONDS) {
+              recordRef.current.active = false
               setIsRecording(false)
-              setShowReport(true)
+              // snapshot data to state for report rendering
+              const snap = {}
+              leads.forEach(ln=>{ snap[ln] = recordRef.current.data[ln].slice() })
+              // Save captured data but DO NOT auto-open the report modal.
+              // User can open it manually via the "View Report" control.
+              setRecordedData(snap)
             }
           }
 
           const samples = bufferRef.current[0]?.length || Math.max(1,Math.floor(sampleRate*secondsWindow))
-          for(let i=0;i<arr.length;i++){
-            const mv = valueToMv(arr[i])
+          for(let i=0;i<mvs.length;i++){
+            const mv = mvs[i]
             if(!bufferRef.current[i]) bufferRef.current[i] = new Float32Array(samples)
             bufferRef.current[i][writeIndexRef.current] = mv
           }
@@ -412,10 +505,9 @@ export default function ECGVisualizer(){
       alert('Connect to device first!')
       return
     }
-    // pre-allocate buffers for each lead
-    const recData = {}
-    leads.forEach(ln => { recData[ln] = [] })
-    setRecordedData(recData)
+    // initialize ref buffers for each lead
+    recordRef.current = { active:true, data:{}, count:0 }
+    leads.forEach(ln => { recordRef.current.data[ln] = [] })
     setRecordingProgress(0)
     setIsRecording(true)
     setShowReport(false)
@@ -512,10 +604,30 @@ export default function ECGVisualizer(){
               <option value="adc">ADC (0-1023)</option>
             </select>
           </label>
-          <button className="btn" onClick={exportPNG}>📷 Export PNG</button>
-          <div style={{marginLeft:'auto',fontSize:14}}>
-            Status: <strong style={{color: isCalibrating ? '#fb923c' : isRecording ? '#ef4444' : (connected ? '#41ff8b' : '#64748b')}}>
-              {isCalibrating ? 'Calibrating...' : isRecording ? `⏺ Recording ${recordingProgress.toFixed(1)}s / ${CAPTURE_SECONDS}s` : (connected ? 'Ready' : 'Disconnected')}
+          <label style={{display:'flex',alignItems:'center',gap:6}}>
+            <input type="checkbox" checked={filterOn} onChange={e=>setFilterOn(e.target.checked)} />
+            <span>Filter 0.5–40 Hz</span>
+          </label>
+          <button className="btn" onClick={exportPNG}>📷 Export Live PNG</button>
+          {recordedData && (
+            <button className="btn" onClick={() => {
+              // Export report offscreen without opening modal
+              const off = document.createElement('canvas')
+              drawReportPage(off, recordedData)
+              const a = document.createElement('a')
+              a.href = off.toDataURL('image/png')
+              a.download = 'ecg-report-10sec.png'
+              a.click()
+            }}>⬇ Export Report PNG</button>
+          )}
+          {recordedData && (
+            <button className="btn" onClick={() => setShowReport(true)} title="View the 10s red-grid report" style={{background:'#dc2626',color:'#fff'}}>
+              🩺 View Report
+            </button>
+          )}
+          <div style={{marginLeft:'auto',fontSize:14,fontWeight:600}}>
+            Status: <strong className={isRecording ? 'recording-indicator' : ''} style={{color: isCalibrating ? '#f59e0b' : isRecording ? '#ff2e97' : (connected ? '#00d9ff' : '#6b7280')}}>
+              {isCalibrating ? '🔄 Calibrating...' : isRecording ? `⏺ Recording ${recordingProgress.toFixed(1)}s / ${CAPTURE_SECONDS}s` : (connected ? '✓ Ready' : '⚠ Disconnected')}
             </strong>
           </div>
         </div>
