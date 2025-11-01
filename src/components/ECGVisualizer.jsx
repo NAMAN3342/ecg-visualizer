@@ -7,7 +7,8 @@ export default function ECGVisualizer(){
   const DEFAULT_MM_PER_MV = 10 // mm per mV
   const DEFAULT_PIXELS_PER_MM = 3
   const DEFAULT_SECONDS = 5
-  const CAPTURE_SECONDS = 10 // automatic report duration (seconds)
+  const CAPTURE_SECONDS = 15 // automatic report duration (seconds)
+  const WAIT_SECONDS = 10 // wait time after capture before report ready
   const ADC_MAX = 1023
   const VREF = 5.0
 
@@ -20,9 +21,11 @@ export default function ECGVisualizer(){
   const [inputUnits, setInputUnits] = useState('mv') // 'mv' | 'adc'
   const [filterOn, setFilterOn] = useState(true) // DSP bandpass (0.5–40 Hz)
 
-  // Final Report Recording (10 seconds)
+  // Final Report Recording (15 seconds + 10s wait)
   const [isRecording, setIsRecording] = useState(false)
   const [recordingProgress, setRecordingProgress] = useState(0)
+  const [isWaiting, setIsWaiting] = useState(false)
+  const [waitProgress, setWaitProgress] = useState(0)
   const [showReport, setShowReport] = useState(false)
   const [recordedData, setRecordedData] = useState(null)
   const reportCanvasRef = useRef(null)
@@ -229,8 +232,9 @@ export default function ECGVisualizer(){
   // Draw report to a given canvas (shared by modal and export)
   function drawReportPage(canvas, data) {
     const ctx = canvas.getContext('2d')
-    const ppm = 8 // pixels per mm for crisp output
-    const paperWidth = 297, paperHeight = 210 // A4 landscape mm
+    const ppm = 6 // pixels per mm - realistic ECG paper resolution
+    const paperWidth = 280 // mm - standard ECG strip width
+    const paperHeight = 200 // mm - realistic height for 6 leads
     canvas.width = paperWidth * ppm
     canvas.height = paperHeight * ppm
 
@@ -238,30 +242,45 @@ export default function ECGVisualizer(){
     ctx.fillStyle = '#ffffff'
     ctx.fillRect(0, 0, canvas.width, canvas.height)
 
-    // Grid
-    // Minor 1mm
+    // Grid - standard ECG paper (1mm minor, 5mm major)
+    // Minor 1mm grid
     ctx.strokeStyle = 'rgba(255, 100, 100, 0.5)'
     ctx.lineWidth = 1
-    for (let x = 0; x <= canvas.width; x += ppm) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,canvas.height); ctx.stroke() }
-    for (let y = 0; y <= canvas.height; y += ppm) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(canvas.width,y); ctx.stroke() }
-    // Major 5mm
+    for (let x = 0; x <= canvas.width; x += ppm) { 
+      ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,canvas.height); ctx.stroke() 
+    }
+    for (let y = 0; y <= canvas.height; y += ppm) { 
+      ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(canvas.width,y); ctx.stroke() 
+    }
+    // Major 5mm grid (0.5 second at 25mm/s, 0.5mV at 10mm/mV)
     ctx.strokeStyle = 'rgba(220,38,38,0.9)'
     ctx.lineWidth = 2
-    for (let x = 0; x <= canvas.width; x += ppm*5) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,canvas.height); ctx.stroke() }
-    for (let y = 0; y <= canvas.height; y += ppm*5) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(canvas.width,y); ctx.stroke() }
+    for (let x = 0; x <= canvas.width; x += ppm*5) { 
+      ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,canvas.height); ctx.stroke() 
+    }
+    for (let y = 0; y <= canvas.height; y += ppm*5) { 
+      ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(canvas.width,y); ctx.stroke() 
+    }
 
-    const marginMm = 10
+    const marginMm = 8
     const margin = marginMm * ppm
-    const headerMm = 25
+    const headerMm = 28
     const headerH = headerMm * ppm
 
-    // Header
+    // Header with comprehensive info
     ctx.fillStyle = '#000'
-    ctx.font = 'bold 20px Arial, Helvetica, sans-serif'
-    ctx.fillText('NextECG — 10 Second ECG Report', margin, margin + 16)
-    ctx.font = '14px Arial, Helvetica, sans-serif'
+    ctx.font = 'bold 18px Arial, Helvetica, sans-serif'
+    const firstLead = data['Lead I'] || data['I'] || data['Lead II'] || data['II'] || data['Lead III'] || data['III']
+    const recordedSeconds = firstLead ? (firstLead.length / sampleRate).toFixed(1) : '0.0'
+    ctx.fillText(`NextECG — 6-Lead ECG Report (${recordedSeconds}s)`, margin, margin + 14)
+    
+    ctx.font = '12px Arial, Helvetica, sans-serif'
     const dateStr = new Date().toLocaleString()
-    ctx.fillText(`${dateStr}  |  Speed: 25 mm/s  |  Amplitude: 10 mm/mV  |  Filter: 0.5–40 Hz  |  ${sampleRate} Hz`, margin, margin + 36)
+    ctx.fillText(`Date: ${dateStr}`, margin, margin + 30)
+    
+    // Technical parameters
+    ctx.fillText(`Time Domain: 25 mm/s  |  Amplitude: 10 mm/mV  |  Sample Rate: ${sampleRate} Hz`, margin, margin + 44)
+    ctx.fillText(`Frequency Domain: Filter 0.5–40 Hz (Bandpass)  |  Recording: ${recordedSeconds} seconds`, margin, margin + 58)
 
     // Calibration pulse 1mV
     const calX = margin
@@ -279,8 +298,8 @@ export default function ECGVisualizer(){
     ctx.fillText('1mV', calX + 6*ppm, calY + 6*ppm)
 
     // Seconds markers across header
-    const anyLead = data['I'] || data['II'] || data['III'] || data['aVR'] || data['aVL'] || data['aVF']
-    const totalSeconds = anyLead ? anyLead.length / sampleRate : 10
+    const sampleLead = data['I'] || data['II'] || data['III'] || data['aVR'] || data['aVL'] || data['aVF']
+    const totalSeconds = sampleLead ? sampleLead.length / sampleRate : 10
     const secondsToShow = Math.ceil(totalSeconds)
     ctx.strokeStyle = '#000'
     ctx.lineWidth = 1.5
@@ -291,16 +310,18 @@ export default function ECGVisualizer(){
       ctx.fillText(`${s}s`, x + 3, margin + headerH - 14)
     }
 
-    // Lead layout
-    const leadOrder = ['I','II','III','aVR','aVL','aVF']
-    const leadHeightMm = 28
+    // Lead layout - all 6 leads clearly labeled
+    const leadOrder = ['Lead I', 'Lead II', 'Lead III', 'aVR', 'aVL', 'aVF']
+    const leadKeys = ['I', 'II', 'III', 'aVR', 'aVL', 'aVF']
+    const leadHeightMm = 26
     const leadHeight = leadHeightMm * ppm
     const startY = margin + headerH + 5
     const innerWidth = canvas.width - 2*margin
 
-    leadOrder.forEach((ln, idx) => {
+    leadOrder.forEach((leadLabel, idx) => {
       const yBase = startY + idx * leadHeight + (leadHeight/2)
-      drawReportLeadStrip(ctx, data[ln], ln, margin, yBase, innerWidth, ppm)
+      const leadKey = leadKeys[idx]
+      drawReportLeadStrip(ctx, data[leadKey], leadLabel, margin, yBase, innerWidth, ppm)
     })
   }
 
@@ -313,10 +334,10 @@ export default function ECGVisualizer(){
   function drawReportLeadStrip(ctx, samples, leadName, xStart, yBase, width, ppm) {
     if (!samples || samples.length === 0) return
     
-    // Lead label - BOLD BLACK
+    // Lead label - BOLD BLACK, proper names
     ctx.fillStyle = '#000000'
-    ctx.font = 'bold 18px Arial, Helvetica, sans-serif'
-    ctx.fillText(leadName, xStart + 2, yBase - 10)
+    ctx.font = 'bold 16px Arial, Helvetica, sans-serif'
+    ctx.fillText(leadName, xStart + 2, yBase - 12)
     
     // Baseline reference
     ctx.strokeStyle = 'rgba(0,0,0,0.15)'
@@ -458,24 +479,15 @@ export default function ECGVisualizer(){
             if(filterOn) mvs[i] = filterSample(i, mvs[i])
           }
 
-          // Recording for final report (auto-capture via ref)
+          // Recording for final report (continuous until user stops)
           if (recordRef.current.active && recordRef.current.data) {
             leads.forEach((ln, idx) => {
               recordRef.current.data[ln].push(mvs[idx])
             })
             recordRef.current.count += 1
             const duration = recordRef.current.count / sampleRateRef.current
-            setRecordingProgress(Math.min(duration, CAPTURE_SECONDS))
-            if (duration >= CAPTURE_SECONDS) {
-              recordRef.current.active = false
-              setIsRecording(false)
-              // snapshot data to state for report rendering
-              const snap = {}
-              leads.forEach(ln=>{ snap[ln] = recordRef.current.data[ln].slice() })
-              // Save captured data but DO NOT auto-open the report modal.
-              // User can open it manually via the "View Report" control.
-              setRecordedData(snap)
-            }
+            setRecordingProgress(duration)
+            // No auto-stop - user must click Stop button
           }
 
           const samples = bufferRef.current[0]?.length || Math.max(1,Math.floor(sampleRate*secondsWindow))
@@ -513,21 +525,57 @@ export default function ECGVisualizer(){
     setShowReport(false)
   }
 
+  function stopRecording() {
+    if (!isRecording) return
+    
+    recordRef.current.active = false
+    setIsRecording(false)
+    
+    // Snapshot data
+    const snap = {}
+    leads.forEach(ln => { snap[ln] = recordRef.current.data[ln].slice() })
+    setRecordedData(snap)
+    
+    // Start 10-second wait
+    setIsWaiting(true)
+    setWaitProgress(0)
+  }
+
+  // Countdown timer for 10-second wait after recording
+  useEffect(() => {
+    if (!isWaiting) return
+    
+    let elapsed = 0
+    const interval = setInterval(() => {
+      elapsed += 0.1
+      setWaitProgress(elapsed)
+      
+      if (elapsed >= WAIT_SECONDS) {
+        clearInterval(interval)
+        setIsWaiting(false)
+        setWaitProgress(0)
+        // Report is now ready - user can view it
+      }
+    }, 100)
+    
+    return () => clearInterval(interval)
+  }, [isWaiting])
+
   // Auto-start capture after calibration completes
   useEffect(() => {
-    if (connected && !isCalibrating && !isRecording && !showReport) {
+    if (connected && !isCalibrating && !isRecording && !showReport && !isWaiting) {
       const timer = setTimeout(() => {
         startRecording()
       }, 500) // Small delay to ensure calibration state is stable
       return () => clearTimeout(timer)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [connected, isCalibrating, isRecording, showReport])
+  }, [connected, isCalibrating, isRecording, showReport, isWaiting])
 
   function downloadReport() {
     if (reportCanvasRef.current) {
       const link = document.createElement('a')
-      link.download = 'ecg-report-10sec.png'
+      link.download = 'ecg-report-15sec.png'
       link.href = reportCanvasRef.current.toDataURL()
       link.click()
     }
@@ -560,7 +608,7 @@ export default function ECGVisualizer(){
         }}>
           <div style={{ maxWidth: '100%', textAlign: 'center' }}>
             <h2 style={{ color: '#dc2626', marginBottom: '20px', fontSize: '24px', fontWeight: 'bold' }}>
-              📄 Final ECG Report (10 seconds)
+              📄 ECG Report — 6-Lead Analysis
             </h2>
             <canvas ref={reportCanvasRef} style={{
               maxWidth: '100%', height: 'auto',
@@ -594,6 +642,12 @@ export default function ECGVisualizer(){
             <button className="btn" onClick={disconnect}>⛔ Disconnect</button>
           )}
           
+          {isRecording && (
+            <button className="btn" onClick={stopRecording} style={{background:'#ef4444',color:'#fff',fontWeight:'bold'}}>
+              ⏹ Stop Recording
+            </button>
+          )}
+          
           <label>Gain: <input type="range" min="0.2" max="6" step="0.1" value={gain} onChange={e=>setGain(parseFloat(e.target.value))} /></label>
           <label>Pixels/mm: <input type="range" min="1" max="6" step="0.5" value={pixelsPerMm} onChange={e=>setPixelsPerMm(parseFloat(e.target.value))} /></label>
           <label>Window (s): <input type="number" min="1" max="10" value={secondsWindow} onChange={e=>setSecondsWindow(parseInt(e.target.value)||1)} /></label>
@@ -616,18 +670,21 @@ export default function ECGVisualizer(){
               drawReportPage(off, recordedData)
               const a = document.createElement('a')
               a.href = off.toDataURL('image/png')
-              a.download = 'ecg-report-10sec.png'
+              a.download = 'ecg-report-15sec.png'
               a.click()
             }}>⬇ Export Report PNG</button>
           )}
-          {recordedData && (
-            <button className="btn" onClick={() => setShowReport(true)} title="View the 10s red-grid report" style={{background:'#dc2626',color:'#fff'}}>
+          {recordedData && !isWaiting && (
+            <button className="btn" onClick={() => setShowReport(true)} title="View the red-grid report" style={{background:'#dc2626',color:'#fff'}}>
               🩺 View Report
             </button>
           )}
           <div style={{marginLeft:'auto',fontSize:14,fontWeight:600}}>
-            Status: <strong className={isRecording ? 'recording-indicator' : ''} style={{color: isCalibrating ? '#f59e0b' : isRecording ? '#ff2e97' : (connected ? '#00d9ff' : '#6b7280')}}>
-              {isCalibrating ? '🔄 Calibrating...' : isRecording ? `⏺ Recording ${recordingProgress.toFixed(1)}s / ${CAPTURE_SECONDS}s` : (connected ? '✓ Ready' : '⚠ Disconnected')}
+            Status: <strong className={isRecording || isWaiting ? 'recording-indicator' : ''} style={{color: isCalibrating ? '#f59e0b' : isRecording ? '#ff2e97' : isWaiting ? '#7c3aed' : (connected ? '#00d9ff' : '#6b7280')}}>
+              {isCalibrating ? '🔄 Calibrating...' : 
+               isRecording ? `⏺ Recording ${recordingProgress.toFixed(1)}s` : 
+               isWaiting ? `⏳ Processing... ${(WAIT_SECONDS - waitProgress).toFixed(1)}s` :
+               (connected ? '✓ Ready' : '⚠ Disconnected')}
             </strong>
           </div>
         </div>
@@ -653,7 +710,7 @@ export default function ECGVisualizer(){
       </div>
 
       <div className="footer-note">
-        Tip: After calibration, 10-second ECG recording starts automatically. Adjust Gain if signal is too small/large.
+        Tip: After calibration, recording starts automatically. Click "⏹ Stop Recording" when you have 10-15 seconds of clean data. Wait 10s for processing, then view the steady ECG report with all 6 leads.
       </div>
     </div>
   )
